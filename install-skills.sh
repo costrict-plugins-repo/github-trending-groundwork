@@ -1,0 +1,1324 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Global state ---
+OVERRIDES=""               # newline-delimited "skill-dir-name=installed-name" exceptions
+TARGETS=()
+SCOPE=""
+FORCE=false
+DRY_RUN=false
+SKILLS_ONLY=false
+ALLOW_MANUAL_CLAUDE=false
+SOURCE_DIR=""
+BODY_SED_CMDS=""           # Pre-built sed commands for name mapping
+MODEL_OVERRIDE_FILE=""      # Optional model policy JSON (all export targets)
+
+# Counters
+SKILL_COUNT=0
+AGENT_COUNT=0
+
+# ============================================================
+# CLI
+# ============================================================
+
+usage() {
+    cat <<'EOF'
+Usage: install-skills.sh [OPTIONS]
+
+Install Groundwork skills and agents into AI coding tools.
+
+Targets (at least one required):
+  --claude-code    Install to Claude Code (recommends marketplace by default)
+  --codex          Install to Codex CLI
+  --opencode       Install to OpenCode
+  --kiro           Install to Kiro
+  --pi             Install to Pi coding agent
+  --zcode          Install to ZCode
+  --zcode-plugin   Export the ZCode marketplace-plugin flavor (native agents;
+                   packaged by build-zcode-marketplace.sh, not for direct install)
+
+Scope (exactly one required):
+  --global         Install to user-level config directory
+  --project        Install to current project directory
+
+Options:
+  --force          Overwrite existing files
+  --dry-run        Preview actions without making changes
+  --skills-only    Install only skills (skip agents)
+  --source DIR     Groundwork source dir (default: auto-detect from script location)
+  --model-override FILE
+                   Apply a model translation/exact-override JSON file (any target)
+  --allow-manual-claude-code-install
+                   Allow manual file-copy install for Claude Code
+  --help           Show help
+
+Examples:
+  ./install-skills.sh --codex --global --dry-run
+  ./install-skills.sh --codex --global --model-override model-overrides/glm.json
+  ./install-skills.sh --zcode --global --model-override model-overrides/glm.json
+  ./install-skills.sh --kiro --project --force
+  ./install-skills.sh --codex --opencode --global
+  ./install-skills.sh --pi --global
+  ./install-skills.sh --zcode --global
+  ./install-skills.sh --zcode-plugin --project   # then build-zcode-marketplace.sh
+  ./install-skills.sh --claude-code --global --allow-manual-claude-code-install
+EOF
+}
+
+parse_args() {
+    TARGETS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --claude-code) TARGETS+=("claude-code") ;;
+            --codex)       TARGETS+=("codex") ;;
+            --opencode)    TARGETS+=("opencode") ;;
+            --kiro)        TARGETS+=("kiro") ;;
+            --pi)          TARGETS+=("pi") ;;
+            --zcode)       TARGETS+=("zcode") ;;
+            --zcode-plugin) TARGETS+=("zcode-plugin") ;;
+            --global)      SCOPE="global" ;;
+            --project)     SCOPE="project" ;;
+            --force)       FORCE=true ;;
+            --dry-run)     DRY_RUN=true ;;
+            --skills-only) SKILLS_ONLY=true ;;
+            --allow-manual-claude-code-install) ALLOW_MANUAL_CLAUDE=true ;;
+            --source)      shift; SOURCE_DIR="$1" ;;
+            --model-override)
+                           shift
+                           if [[ $# -eq 0 ]]; then
+                               echo "Error: --model-override requires a file path" >&2
+                               exit 1
+                           fi
+                           MODEL_OVERRIDE_FILE="$1" ;;
+            --help)        usage; exit 0 ;;
+            *)             echo "Error: Unknown option: $1"; echo; usage; exit 1 ;;
+        esac
+        shift
+    done
+
+    if [[ ${#TARGETS[@]} -eq 0 ]]; then
+        echo "Error: At least one target required (--claude-code, --codex, --opencode, --kiro, --pi, --zcode, --zcode-plugin)" >&2
+        exit 1
+    fi
+
+    if [[ -z "$SCOPE" ]]; then
+        echo "Error: Scope required (--global or --project)" >&2
+        exit 1
+    fi
+}
+
+# ============================================================
+# Setup
+# ============================================================
+
+auto_detect_source() {
+    if [[ -z "$SOURCE_DIR" ]]; then
+        SOURCE_DIR="$SCRIPT_DIR"
+    fi
+    if [[ ! -d "$SOURCE_DIR/skills" ]]; then
+        echo "Error: Cannot find skills/ directory in $SOURCE_DIR"
+        exit 1
+    fi
+}
+
+# Resolve a skill-dir name to its installed name: an explicit override from
+# install-config.txt if present, otherwise the fail-closed default
+# (groundwork-<name>). Returns "drop" for skills excluded by the config.
+# bash 3.2 compatible — no associative array.
+installed_name() {
+    local skill="$1" line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "${line%%=*}" == "$skill" ]]; then
+            echo "${line#*=}"
+            return
+        fi
+    done <<< "$OVERRIDES"
+    echo "groundwork-${skill}"
+}
+
+should_export_skill() {
+    local target="$1" skill="$2"
+    [[ "$skill" != "statusline" || "$target" == "codex" ]]
+}
+
+load_config() {
+    local config="$SOURCE_DIR/install-config.txt"
+
+    # Fail-closed: every skill on disk exports as groundwork-<name> by default.
+    # The config file lists only exceptions (drops and custom renames), so a
+    # newly-added skill is exported automatically and can never be silently
+    # omitted by forgetting to register it. Exceptions are kept as a small
+    # newline-delimited string and consulted by installed_name().
+    OVERRIDES=""
+    if [[ -f "$config" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// /}" ]] && continue
+
+            local lhs installed rhs
+            lhs=$(echo "$line" | sed 's/[[:space:]]*=.*//' | xargs)
+            rhs=$(echo "$line" | sed 's/[^=]*=[[:space:]]*//')
+            installed=$(echo "$rhs" | awk '{print $1}')
+
+            OVERRIDES+="${lhs}=${installed}"$'\n'
+        done < "$config"
+    fi
+
+    # Pre-build sed commands for groundwork:name → mapped-name
+    # Order matters: more specific patterns first to avoid partial matches
+    BODY_SED_CMDS=""
+
+    # 1. Agent triple refs (groundwork:X:X → the X agent) — most specific
+    for agent_dir in "$SOURCE_DIR"/agents/*/; do
+        [[ ! -d "$agent_dir" ]] && continue
+        local agent_name
+        agent_name=$(basename "$agent_dir")
+        BODY_SED_CMDS+="s|groundwork:${agent_name}:${agent_name}|the ${agent_name} agent|g"$'\n'
+    done
+
+    # 2. Skill name mappings: every skill dir (default or overridden) + reverse aliases
+    for skill_dir in "$SOURCE_DIR"/skills/*/; do
+        [[ ! -d "$skill_dir" ]] && continue
+        local skill mapped suffix
+        skill=$(basename "$skill_dir")
+        mapped=$(installed_name "$skill")
+        if [[ "$mapped" != "drop" ]]; then
+            # Primary: groundwork:<skill> → <installed-name>
+            BODY_SED_CMDS+="s|groundwork:${skill}|${mapped}|g"$'\n'
+            # Reverse alias: if installed suffix differs from skill name,
+            # also map groundwork:<suffix> → <installed-name>
+            suffix="${mapped#groundwork-}"
+            if [[ "$suffix" != "$skill" ]]; then
+                BODY_SED_CMDS+="s|groundwork:${suffix}|${mapped}|g"$'\n'
+            fi
+        fi
+    done
+
+    # 3. Agent single refs (for agents with no same-named skill)
+    for agent_dir in "$SOURCE_DIR"/agents/*/; do
+        [[ ! -d "$agent_dir" ]] && continue
+        local agent_name
+        agent_name=$(basename "$agent_dir")
+        if [[ ! -d "$SOURCE_DIR/skills/$agent_name" ]]; then
+            BODY_SED_CMDS+="s|groundwork:${agent_name}|the ${agent_name} agent|g"$'\n'
+        fi
+    done
+}
+
+load_model_override() {
+    if [[ -z "$MODEL_OVERRIDE_FILE" ]]; then
+        return 0
+    fi
+
+    local args=(--source "$SOURCE_DIR" --file "$MODEL_OVERRIDE_FILE")
+    [[ "$SKILLS_ONLY" == true ]] && args+=(--skills-only)
+    node "$SOURCE_DIR/lib/model-override.js" validate "${args[@]}"
+}
+
+preflight_model_override_replacements() {
+    if [[ -z "$MODEL_OVERRIDE_FILE" || "$DRY_RUN" == true || "$FORCE" == true ]]; then
+        return 0
+    fi
+
+    local target
+    for target in "${TARGETS[@]}"; do
+        # Claude Code is a fresh full-copy install; the override is applied to
+        # the copy after it is written, so there is nothing to preflight.
+        [[ "$target" == "claude-code" ]] && continue
+
+        local dest_base
+        dest_base=$(get_dest_base "$target")
+
+        local skill_dir skill_name skill_file installed dest
+        for skill_dir in "$SOURCE_DIR"/skills/*/; do
+            skill_name=$(basename "$skill_dir")
+            skill_file="$skill_dir/SKILL.md"
+            [[ -f "$skill_file" ]] || continue
+            should_export_skill "$target" "$skill_name" || continue
+            installed=$(installed_name "$skill_name")
+            [[ "$installed" == "drop" ]] && continue
+            dest="$dest_base/skills/$installed/SKILL.md"
+            require_model_override_replacement "$dest" "skill" "$skill_name"
+        done
+
+        [[ "$SKILLS_ONLY" == true ]] && continue
+
+        local agent_dir agent_name
+        for agent_dir in "$SOURCE_DIR"/agents/*/; do
+            agent_name=$(basename "$agent_dir")
+            [[ -f "$agent_dir/AGENT.md" ]] || continue
+            case "$target" in
+                codex)        dest="$dest_base/agents/${agent_name}.toml" ;;
+                opencode)     dest="$dest_base/agents/review-${agent_name}.md" ;;
+                kiro)         dest="$dest_base/agents/${agent_name}-prompt.md" ;;
+                pi|zcode)     dest="$dest_base/skills/review-${agent_name}/SKILL.md" ;;
+                zcode-plugin) dest="$dest_base/agents/${agent_name}.md" ;;
+            esac
+            require_model_override_replacement "$dest" "agent" "$agent_name"
+        done
+    done
+}
+
+# ============================================================
+# Destination paths
+# ============================================================
+
+# Harness identifier accepted by the portable runtime scripts
+# (lib/project-context-cli.js validates against a fixed list).
+harness_name() {
+    if [[ "$1" == "zcode-plugin" ]]; then echo "zcode"; else echo "$1"; fi
+}
+
+get_dest_base() {
+    local target="$1"
+    case "$target" in
+        claude-code)
+            if [[ "$SCOPE" == "global" ]]; then echo "$HOME/.claude/plugins/groundwork"
+            else echo ".claude/plugins/groundwork"; fi ;;
+        codex)
+            if [[ "$SCOPE" == "global" ]]; then echo "$HOME/.codex"
+            else echo ".codex"; fi ;;
+        opencode)
+            if [[ "$SCOPE" == "global" ]]; then echo "$HOME/.config/opencode"
+            else echo ".opencode"; fi ;;
+        kiro)
+            if [[ "$SCOPE" == "global" ]]; then echo "$HOME/.kiro"
+            else echo ".kiro"; fi ;;
+        pi)
+            if [[ "$SCOPE" == "global" ]]; then echo "$HOME/.pi/agent"
+            else echo ".pi"; fi ;;
+        zcode)
+            if [[ "$SCOPE" == "global" ]]; then echo "$HOME/.zcode"
+            else echo ".zcode"; fi ;;
+        zcode-plugin)
+            if [[ "$SCOPE" == "global" ]]; then echo "$HOME/.zcode"
+            else echo ".zcode"; fi ;;
+    esac
+}
+
+# ============================================================
+# Frontmatter & body helpers
+# ============================================================
+
+# Export a checked runtime closure beside a skill or agent. No second list of
+# transitive dependencies: the manifest scanner derives helper bundles.
+write_runtime_bundle() {
+    local runtime_dir="$1" target="$2" dest_base="$3" format="$4"
+    shift 4
+    local entries
+    entries=$(node "$SOURCE_DIR/lib/external-runner-manifest.js" "$format" "$@") || return 1
+    local source_file installed_file
+    while IFS=$'\t' read -r source_file installed_file; do
+        [[ -n "$source_file" ]] || continue
+        if [[ "$target" == "codex" ]]; then
+            write_codex_agent "$runtime_dir/$installed_file" "$(<"$SOURCE_DIR/$source_file")" "checked runtime helper" "$dest_base"
+        else
+            write_file "$runtime_dir/$installed_file" "$(<"$SOURCE_DIR/$source_file")" "checked runtime helper"
+        fi
+    done <<< "$entries"
+}
+
+# Extract a single YAML frontmatter value (single-line only)
+get_fm_value() {
+    local content="$1" key="$2"
+    echo "$content" | sed -n '/^---$/,/^---$/p' | sed -n "s/^${key}:[[:space:]]*//p" | head -1
+}
+
+# Extract body text (everything after second ---)
+get_body() {
+    echo "$1" | awk 'BEGIN{c=0} /^---$/{c++;if(c==2){f=1;next}} f{print}'
+}
+
+# Resolve builtin and user-overridden Codex agent policy in one place. The
+# builtin policy is versioned in lib/codex-model-policy.json.
+resolve_codex_agent_policy() {
+    local agent_name="$1" source_model="$2" source_effort="$3"
+    local args=(
+        resolve-agent
+        --format shell
+        --name "$agent_name"
+        --source-model "$source_model"
+        --source-effort "$source_effort"
+    )
+    [[ -n "$MODEL_OVERRIDE_FILE" ]] && args+=(--file "$MODEL_OVERRIDE_FILE")
+
+    local resolved
+    resolved=$(node "$SOURCE_DIR/lib/model-override.js" "${args[@]}")
+    if [[ "$resolved" != *$'\t'* ]]; then
+        echo "Error: Invalid Codex agent model policy result: $resolved" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r CODEX_AGENT_MODEL CODEX_AGENT_EFFORT <<< "$resolved"
+}
+
+# Recursively inline required skill bodies into a parent skill.
+# Appends dependency content as appendix sections.
+# Uses _INLINE_VISITED (global within subshell) to prevent duplicates.
+# Arguments: $1=skill directory name
+inline_requires() {
+    local skill_name="$1"
+    local skill_file="$SOURCE_DIR/skills/$skill_name/SKILL.md"
+    [[ ! -f "$skill_file" ]] && return
+
+    local content
+    content=$(<"$skill_file")
+    local requires_line
+    requires_line=$(get_fm_value "$content" "requires")
+    [[ -z "$requires_line" ]] && return
+
+    local deps dep
+    IFS=',' read -ra deps <<< "$requires_line"
+    for dep in "${deps[@]}"; do
+        dep=$(echo "$dep" | xargs)  # trim whitespace
+        [[ -z "$dep" ]] && continue
+        [[ ":$_INLINE_VISITED:" == *":$dep:"* ]] && continue
+        _INLINE_VISITED="$_INLINE_VISITED:$dep"
+
+        # Recurse depth-first for transitive deps
+        inline_requires "$dep"
+
+        local dep_file="$SOURCE_DIR/skills/$dep/SKILL.md"
+        [[ ! -f "$dep_file" ]] && continue
+        local dep_content
+        dep_content=$(<"$dep_file")
+        local dep_body
+        dep_body=$(get_body "$dep_content")
+        local dep_name
+        dep_name=$(get_fm_value "$dep_content" "name")
+
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Appendix: ${dep_name:-$dep} Workflow"
+        echo ""
+        echo "> Follow these steps when the main workflow references this workflow."
+        echo ""
+        echo "$dep_body"
+    done
+}
+
+# Inline ${CLAUDE_PLUGIN_ROOT}/references/<path> files into an agent body as
+# appendix sections. ZCode plugin agents are flat agents/<name>.md files with
+# no sibling directories, so references cannot ship alongside them.
+inline_agent_references() {
+    local content="$1"
+    local appendices="" refs ref rel source_file
+    refs=$(printf '%s\n' "$content" | \
+        grep -o '\${CLAUDE_PLUGIN_ROOT}/references/[A-Za-z0-9._/-]*' | \
+        sed 's|^.*references/||' | sort -u)
+    for ref in $refs; do
+        [[ -z "$ref" ]] && continue
+        source_file="$SOURCE_DIR/references/$ref"
+        [[ -f "$source_file" ]] || continue
+        rel="${ref%.md}"
+        content=$(printf '%s\n' "$content" | \
+            sed -e 's|`\${CLAUDE_PLUGIN_ROOT}/references/'"$ref"'`|the '"$rel"' appendix below|g' \
+                -e 's|\${CLAUDE_PLUGIN_ROOT}/references/'"$ref"'|the '"$rel"' appendix below|g')
+        appendices+=$'\n---\n\n## Appendix: '"${rel}"$'\n\n'"$(<"$source_file")"$'\n'
+    done
+    printf '%s%s\n' "$content" "$appendices"
+}
+
+# Rewrite frontmatter for target tool
+transform_frontmatter() {
+    local target="$1" component="$2" content="$3" installed_name="$4"
+    local desc
+    desc=$(get_fm_value "$content" "description")
+    # Strip the Claude-Code-only slash-command hint ("Usage /groundwork:<name> ...").
+    # Other harnesses have no /groundwork: slash command — they discover skills by
+    # description match — so the clause is noise and would leak a "groundwork:" ref.
+    desc=$(printf '%s' "$desc" | sed 's| *Usage /groundwork:.*$||')
+
+    echo "---"
+    case "$component" in
+        skill)
+            case "$target" in
+                codex|kiro|pi|zcode|zcode-plugin)
+                    echo "name: $installed_name"
+                    echo "description: $desc"
+                    ;;
+                opencode)
+                    echo "name: $installed_name"
+                    echo "description: $desc"
+                    ;;
+            esac
+            ;;
+        agent)
+            echo "name: $installed_name"
+            echo "description: $desc"
+            ;;
+    esac
+    echo "---"
+}
+
+# Apply body text transformations for non-Claude targets
+transform_body() {
+    local target="$1" content="$2" component="${3:-skill}"
+    local reference_root reference_sed
+    if [[ "$component" == "agent" ]]; then
+        reference_root="<agent-directory>/references"
+    else
+        reference_root="<skill-directory>/references"
+    fi
+    reference_sed='s|\${CLAUDE_PLUGIN_ROOT}/references|'"$reference_root"'|g'
+
+    if [[ "$target" != "codex" ]]; then
+        content=$(printf '%s\n' "$content" | sed '\|/groundwork:statusline|d')
+    fi
+
+    # Codex model names differ from Claude Code's. Keep source recommendations
+    # native to Claude Code and translate only the Codex export.
+    if [[ "$target" == "codex" ]]; then
+        content=$(echo "$content" | sed \
+            -e 's|Sonnet or Opus|Terra or Sol|g' \
+            -e 's|sonnet or opus|terra or sol|g' \
+            -e 's|Opus (1M context)|Sol|g' \
+            -e 's|opus\[1m\]|sol|g' \
+            -e 's|Haiku|Luna|g' \
+            -e 's|haiku|luna|g' \
+            -e 's|Sonnet|Terra|g' \
+            -e 's|sonnet|terra|g' \
+            -e 's|Opus|Sol|g' \
+            -e 's|opus|sol|g'
+        )
+    fi
+
+    # ZCode runs the GLM model family and has no Claude-style /model or
+    # /effort slash commands, so translate model recommendations into concrete
+    # GLM family names (unversioned — GLM and GLM-Flash — since versions churn
+    # while family names are stable) and refer to the model picker/settings
+    # rather than slash commands. On ZCode the reasoning effort IS the effort
+    # setting (one axis, no separate model tier above GLM), so the Claude-era
+    # two-dimensional pre-flight gate (effort × model) must collapse to
+    # effort-only before the name substitutions below run: strip the model
+    # clause from the skip condition and drop the "not <model>" else-line.
+    if [[ "$target" == "zcode" || "$target" == "zcode-plugin" ]]; then
+        content=$(echo "$content" | sed \
+            -e 's|All required skills (\(.*\)) are preloaded into your context — you do NOT need to call `Skill()` to load them. Follow the skill instructions directly.|Required skills are not preloaded in this harness: load each via the Skill tool before starting (each is installed with the groundwork- prefix: \1), then follow the skill instructions directly.|' \
+            -e 's|The `\([a-z-]*\)` skill is preloaded into your context — you do NOT need to call `Skill()` to load it. Follow the skill instructions directly.|The \1 skill is not preloaded in this harness: load it via the Skill tool before starting (installed as groundwork-\1), then follow the skill instructions directly.|' \
+            -e 's|— you have all skills preloaded|— load any skills you need via the Skill tool|g' \
+            -e 's|^Selection scope: .*|Selection scope: this harness runs every chat against one shared workspace selection — the persisted selection is a workspace-level default, not a per-chat fact. Treat the selection as conversation-scoped: state the active project in your reply, and pass it explicitly on later invocations (`--project <name>` where groundwork-plan-task, groundwork-implement-task, and groundwork-validate support it, or `GROUNDWORK_PROJECT=<name>` for lib scripts).|' \
+            -e 's| AND you are Sonnet or Opus\.|.|' \
+            -e 's| AND you are Opus (1M context)\.|.|' \
+            -e '/^If you are not Sonnet or Opus, you MUST show the recommendation prompt/d' \
+            -e '/^If you are not Opus (1M context), you MUST show the recommendation prompt/d' \
+            -e 's|you are Sonnet or Opus|you are on GLM with reasoning at max|g' \
+            -e 's|you are not Sonnet or Opus|you are not on GLM with reasoning at max|g' \
+            -e 's|you are Opus (1M context)|you are on GLM with reasoning at max|g' \
+            -e 's|you are not Opus (1M context)|you are not on GLM with reasoning at max|g' \
+            -e 's|Sonnet or Opus at high effort|GLM with reasoning at max|g' \
+            -e 's|Opus (1M context) at high effort|GLM with reasoning at max|g' \
+            -e 's|run `/effort high` (and `/model sonnet` if on Haiku)|raise the reasoning effort to max in the model settings (and switch to GLM in the model picker if you are on GLM-Flash)|g' \
+            -e 's|run `/model opus\[1m\]` and `/effort high`|switch to GLM in the model picker and set the reasoning effort to max|g' \
+            -e 's|`model: "opus"`|GLM|g' \
+            -e 's|Sonnet or Opus|GLM|g' \
+            -e 's|sonnet or opus|GLM|g' \
+            -e 's|Opus (1M context)|GLM|g' \
+            -e 's|opus\[1m\]|GLM|g' \
+            -e 's|Haiku|GLM-Flash|g' \
+            -e 's|haiku|GLM-Flash|g' \
+            -e 's|Sonnet|GLM|g' \
+            -e 's|sonnet|GLM|g' \
+            -e 's|Opus|GLM|g' \
+            -e 's|opus|GLM|g'
+        )
+    fi
+
+    # Pi-specific tool name transforms (run before shared pipeline)
+    if [[ "$target" == "pi" ]]; then
+        content=$(echo "$content" | sed \
+            -e 's|\bRead\b tool|read tool|g' \
+            -e 's|\bEdit\b tool|edit tool|g' \
+            -e 's|\bWrite\b tool|write tool|g' \
+            -e 's|\bBash\b tool|bash tool|g' \
+            -e 's|\bGlob\b tool|find tool|g' \
+            -e 's|\bGrep\b tool|grep tool|g' \
+            -e 's|`Read`|`read`|g' \
+            -e 's|`Edit`|`edit`|g' \
+            -e 's|`Write`|`write`|g' \
+            -e 's|`Bash`|`bash`|g' \
+            -e 's|`Glob`|`find`|g' \
+            -e 's|`Grep`|`grep`|g' \
+            -e 's|`Task`|`groundwork_agent`|g' \
+            -e 's|the Task tool|the groundwork_agent tool|g' \
+            -e 's|Task tool|groundwork_agent tool|g' \
+            -e 's|Use Task tool|Use groundwork_agent tool|g' \
+            -e 's|subagent_type|agent|g' \
+        )
+    fi
+
+    # Build appendix-aware sed expressions conditionally per target
+    local appendix_seds=()
+    if [[ "$target" == "opencode" ]]; then
+        # OpenCode: skill deps are inlined as appendix — name is lost, appendix has content
+        appendix_seds=(
+            -e 's|\*\*You MUST call the Skill tool now:\*\*.*|\*\*Follow the referenced workflow steps in the appendix below.\*\*|g'
+            -e 's|Invoke the `\(groundwork:[^`]*\)` skill|Follow the \1 workflow steps (see appendix below)|g'
+            -e 's|Invoke the `\([^`]*\)` skill|Follow the \1 workflow steps (see appendix below)|g'
+            -e 's|[Ii]nvoke the skill `\([^`]*\)`|Follow the \1 workflow steps (see appendix below)|g'
+            -e 's|[Ii]nvoke `\([^`]*\)` skill|Follow the \1 workflow steps (see appendix below)|g'
+        )
+    else
+        # Codex/Kiro/Pi: no inlining — preserve skill name reference for BODY_SED_CMDS mapping
+        appendix_seds=(
+            -e 's|\*\*You MUST call the Skill tool now:\*\* `\([^`]*\)`|You MUST call the skill `\1` now.|g'
+            -e 's|Invoke the `\(groundwork:[^`]*\)` skill|Follow the workflow steps in skill `\1`|g'
+            -e 's|Invoke the `\([^`]*\)` skill|Follow the workflow steps in skill `\1`|g'
+            -e 's|[Ii]nvoke the skill `\([^`]*\)`|Follow the workflow steps in skill `\1`|g'
+            -e 's|[Ii]nvoke `\([^`]*\)` skill|Follow the workflow steps in skill `\1`|g'
+        )
+    fi
+
+    echo "$content" | \
+        node "$SOURCE_DIR/lib/transform-agents.js" --target "$target" | \
+        sed \
+        -e 's|Skill(skill="\(groundwork:[^"]*\)"[^)]*)|the \1 workflow|g' \
+        -e "s|Skill(skill='\(groundwork:[^']*\)'[^)]*)|the \1 workflow|g" \
+        "${appendix_seds[@]}" \
+        -e 's|[Ii]nvoke `\(the [^`]* workflow\)`|Follow \1 steps|g' \
+        -e 's|AskUserQuestion|Ask the user|g' \
+        -e 's|ExitPlanMode()|Proceed with implementation|g' \
+        -e 's|context compaction|context management|g' \
+        -e 's|subagent|sub-task|g' \
+        -e "$reference_sed" \
+        -e 's|\${CLAUDE_PLUGIN_ROOT}|the plugin directory|g' \
+        -e "${BODY_SED_CMDS:-.}"
+}
+
+translate_statusline_body() {
+    cat "$SOURCE_DIR/skills/statusline/codex-skill-body.md"
+}
+
+portable_project_context_preamble() {
+    local target="$1"
+    cat <<EOF
+## Portable Project Context
+
+Before interpreting project-context placeholders in this workflow:
+
+1. Resolve the directory containing this \`SKILL.md\`.
+2. Run \`node <skill-directory>/scripts/project-context-cli.js resolve --harness ${target}\` from the repository working directory.
+3. Use the returned JSON values as the exact bindings for \`{{project_name}}\`, \`{{project_root}}\`, \`{{specs_dir}}\`, \`{{plans_dir}}\`, \`{{debug_dir}}\`, and \`{{research_dir}}\` everywhere below.
+4. If \`selection_required\` is true, follow the \`groundwork-select-project\` workflow, then resolve again.
+
+EOF
+}
+
+portable_runtime_context_preamble() {
+    cat <<'EOF'
+## Codex Runtime Context
+
+Before applying any model or effort recommendation in this workflow:
+
+1. Resolve the directory containing this `SKILL.md`.
+2. Run `node <skill-directory>/scripts/runtime-context-cli.js --harness codex` from the repository working directory.
+3. Use the returned `effort_level` and `model` values as the exact bindings for `{{effort_level}}` and the current model.
+4. Do not infer either value from the generic assistant family label when the resolver returns a concrete value.
+
+EOF
+}
+
+# ============================================================
+# File writing
+# ============================================================
+
+model_override_affects() {
+    local kind="$1" name="$2"
+    [[ -z "$MODEL_OVERRIDE_FILE" ]] && return 1
+
+    local result
+    result=$(node "$SOURCE_DIR/lib/model-override.js" affects \
+        --file "$MODEL_OVERRIDE_FILE" \
+        --source "$SOURCE_DIR" \
+        --kind "$kind" \
+        --name "$name")
+    [[ "$result" == "yes" ]]
+}
+
+require_model_override_replacement() {
+    local dest="$1" kind="$2" name="$3"
+    [[ "$DRY_RUN" == true ]] && return 0
+    [[ "$FORCE" == true ]] && return 0
+    model_override_affects "$kind" "$name" || return 0
+
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        echo "Error: $dest exists and the model override changes it; rerun with --force" >&2
+        exit 1
+    fi
+}
+
+transform_model_override() {
+    local kind="$1" name="$2" target="$3" content="$4"
+    # Codex also resolves builtin tier aliases after policy injection.
+    if [[ -z "$MODEL_OVERRIDE_FILE" && "$target" != "codex" ]]; then
+        printf '%s\n' "$content"
+        return
+    fi
+    local args=(--kind "$kind" --name "$name" --harness "$target")
+    [[ -n "$MODEL_OVERRIDE_FILE" ]] && args+=(--file "$MODEL_OVERRIDE_FILE")
+
+    printf '%s\n' "$content" | node "$SOURCE_DIR/lib/model-override.js" transform "${args[@]}"
+}
+
+write_file() {
+    local dest="$1" content="$2" label="$3"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [dry-run] $dest ($label)"
+        return 0
+    fi
+
+    if [[ -f "$dest" && "$FORCE" != true ]]; then
+        echo "  [skip] $dest (exists, use --force)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    printf '%s\n' "$content" > "$dest"
+    echo "  [wrote] $dest ($label)"
+}
+
+# Keep portable components self-contained without copying the entire shared tree.
+write_portable_references() {
+    local content="$1" dest_dir="$2"
+    local references
+    references=$(printf '%s\n' "$content" | awk '
+        {
+            line = $0
+            marker = "${CLAUDE_PLUGIN_ROOT}/references/"
+            while ((start = index(line, marker)) > 0) {
+                line = substr(line, start + length(marker))
+                if (match(line, /^[A-Za-z0-9._\/-]+/)) {
+                    print "references/" substr(line, RSTART, RLENGTH)
+                    line = substr(line, RLENGTH + 1)
+                } else {
+                    break
+                }
+            }
+        }
+    ' | sort -u)
+
+    local reference source
+    while IFS= read -r reference; do
+        [[ -z "$reference" ]] && continue
+        source="$SOURCE_DIR/$reference"
+        [[ -f "$source" ]] || continue
+        write_file "$dest_dir/$reference" "$(<"$source")" "reference"
+    done <<< "$references"
+}
+
+# Copy skill-local files named in inline code so progressive-disclosure
+# resources remain available after portable export.
+write_portable_skill_resources() {
+    local content="$1" source_dir="$2" dest_dir="$3"
+    local resources
+    resources=$(printf '%s\n' "$content" | awk '
+        {
+            line = $0
+            while (match(line, /`[A-Za-z0-9._\/-]+`/)) {
+                resource = substr(line, RSTART + 1, RLENGTH - 2)
+                if (resource != "SKILL.md" &&
+                    resource !~ /^\// &&
+                    resource !~ /(^|\/)\.\.(\/|$)/) {
+                    print resource
+                }
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' | sort -u)
+
+    local resource source
+    while IFS= read -r resource; do
+        [[ -z "$resource" ]] && continue
+        source="$source_dir/$resource"
+        [[ -f "$source" ]] || continue
+        write_file "$dest_dir/$resource" "$(<"$source")" "skill resource"
+    done <<< "$resources"
+}
+
+write_codex_agent() {
+    local dest="$1" content="$2" label="$3" dest_base="$4"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [dry-run] $dest ($label)"
+        return 0
+    fi
+
+    local args=(--base "$dest_base" --dest "$dest")
+    [[ "$FORCE" == true ]] && args+=(--force)
+
+    local result
+    result=$(printf '%s\n' "$content" | node "$SOURCE_DIR/lib/write-codex-agent.js" "${args[@]}")
+    if [[ "$result" == "skipped" ]]; then
+        echo "  [skip] $dest (exists, use --force)"
+    else
+        echo "  [wrote] $dest ($label)"
+    fi
+}
+
+remove_legacy_codex_agent_skill() {
+    local agent_name="$1" dest_base="$2"
+    local legacy_skill="$dest_base/skills/review-${agent_name}/SKILL.md"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        if [[ -e "$legacy_skill" || -L "$legacy_skill" ]]; then
+            echo "  [dry-run] remove $legacy_skill (legacy agent skill)"
+        fi
+        return 0
+    fi
+
+    local result
+    result=$(node "$SOURCE_DIR/lib/remove-legacy-codex-agent-skill.js" \
+        --base "$dest_base" --skill "$legacy_skill")
+    if [[ "$result" == "removed" ]]; then
+        echo "  [removed] $legacy_skill (legacy agent skill)"
+    fi
+}
+
+remove_legacy_codex_runner_memory() {
+    local dest_base="$1"
+    local legacy_sidecar="$dest_base/task-executor-memory.js"
+
+    if [[ ! -e "$legacy_sidecar" && ! -L "$legacy_sidecar" ]]; then
+        return 0
+    fi
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [dry-run] remove $legacy_sidecar (legacy runner memory sidecar)"
+        return 0
+    fi
+    if [[ ! -f "$legacy_sidecar" && ! -L "$legacy_sidecar" ]]; then
+        echo "Error: Legacy runner memory sidecar is not a file: $legacy_sidecar" >&2
+        return 1
+    fi
+    rm -f -- "$legacy_sidecar"
+    echo "  [removed] $legacy_sidecar (legacy runner memory sidecar)"
+}
+
+# ============================================================
+# Install: Claude Code
+# ============================================================
+
+# Apply the model override to a fresh full-copy Claude Code install. The copy
+# was just written, so the existing-file preflight does not apply; files are
+# rewritten in place (frontmatter included, since agents carry model fields).
+apply_claude_code_model_override() {
+    local dest="$1"
+    [[ -z "$MODEL_OVERRIDE_FILE" || "$DRY_RUN" == true ]] && return 0
+
+    local item_file item_name kind count=0
+    for item_file in "$dest"/skills/*/SKILL.md "$dest"/agents/*/AGENT.md; do
+        [[ -f "$item_file" ]] || continue
+        item_name=$(basename "$(dirname "$item_file")")
+        kind="skill"
+        [[ "$item_file" == *"/agents/"* ]] && kind="agent"
+        printf '%s\n' "$(<"$item_file")" | node "$SOURCE_DIR/lib/model-override.js" transform \
+            --kind "$kind" --name "$item_name" --harness claude-code \
+            --file "$MODEL_OVERRIDE_FILE" > "$item_file.override"
+        mv "$item_file.override" "$item_file"
+        ((count++)) || true
+    done
+    echo "  [override] applied model override to $count files"
+}
+
+install_claude_code() {
+    local dest
+    dest=$(get_dest_base "claude-code")
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [dry-run] Would copy $SOURCE_DIR → $dest"
+        [[ -n "$MODEL_OVERRIDE_FILE" ]] && echo "  [dry-run] Would apply model override to the copied skills and agents"
+        return 0
+    fi
+
+    if [[ -d "$dest" && "$FORCE" != true ]]; then
+        echo "  [skip] $dest (exists, use --force)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    if [[ "$FORCE" == true && -d "$dest" ]]; then
+        rm -rf "$dest"
+    fi
+    cp -r "$SOURCE_DIR" "$dest"
+    echo "  [copied] $SOURCE_DIR → $dest"
+    apply_claude_code_model_override "$dest"
+}
+
+# ============================================================
+# Install: Skills
+# ============================================================
+
+install_skills_for_target() {
+    local target="$1"
+    SKILL_COUNT=0
+
+    for skill_dir in "$SOURCE_DIR"/skills/*/; do
+        local skill_name
+        skill_name=$(basename "$skill_dir")
+        local skill_file="$skill_dir/SKILL.md"
+        [[ ! -f "$skill_file" ]] && continue
+        should_export_skill "$target" "$skill_name" || continue
+
+        local installed
+        installed=$(installed_name "$skill_name")
+        [[ "$installed" == "drop" ]] && continue
+
+        local content
+        content=$(<"$skill_file")
+        local raw_body
+        raw_body=$(get_body "$content")
+
+        # Inline required skill bodies — only OpenCode needs appendix sections
+        if [[ "$target" == "opencode" ]]; then
+            local inlined_deps
+            inlined_deps=$(_INLINE_VISITED="$skill_name"; inline_requires "$skill_name")
+            if [[ -n "$inlined_deps" ]]; then
+                raw_body="$raw_body
+$inlined_deps"
+            fi
+        fi
+
+        local new_fm new_body result
+        new_fm=$(transform_frontmatter "$target" "skill" "$content" "$installed")
+        if [[ "$target" == "codex" && "$skill_name" == "statusline" ]]; then
+            new_body=$(translate_statusline_body)
+        else
+            new_body=$(transform_body "$target" "$raw_body" "skill")
+        fi
+        if [[ "$target" == "codex" ]]; then
+            new_body=$(printf '%s\n' "$new_body" | node \
+                "$SOURCE_DIR/lib/apply-codex-skill-policy.js" --skill "$skill_name")
+        fi
+
+        local needs_project_runtime=false
+        local needs_runtime_context=false
+        local needs_validate_scripts=false
+        local needs_worktree_identity=false
+        local needs_batch_runner=false
+        if [[ "$target" == "codex" && ( "$raw_body" == *'{{effort_level}}'* || "$skill_name" == "validate" ) ]]; then
+            needs_runtime_context=true
+            new_body="$(portable_runtime_context_preamble)
+
+$new_body"
+        fi
+        # Content-gated, not name-gated: setup-repo and select-project (and
+        # any future skill) persist selections through the same command.
+        if [[ "$new_body" == *"node the plugin directory/lib/persist-project.js"* ]]; then
+            needs_project_runtime=true
+            new_body=$(printf '%s' "$new_body" | sed \
+                "s|node the plugin directory/lib/persist-project.js \"<selected-name>\"|node <skill-directory>/scripts/project-context-cli.js select \"<selected-name>\" --harness $(harness_name "$target")|")
+        fi
+        # Content-gated, not name-gated: OpenCode inlines required skill
+        # bodies (e.g. validate's commands inside work-on), and the inlined
+        # copies need the same rewrites and shipped scripts as the original.
+        if [[ "$new_body" == *"node the plugin directory/lib/persist-unworked-findings.js"* ]]; then
+            needs_validate_scripts=true
+            new_body=$(printf '%s' "$new_body" | sed \
+                's|node the plugin directory/lib/persist-unworked-findings.js|node <skill-directory>/scripts/persist-unworked-findings.js|g')
+        fi
+        if [[ "$new_body" == *"node the plugin directory/lib/validation-session.js"* ]]; then
+            needs_validate_scripts=true
+            new_body=$(printf '%s' "$new_body" | sed \
+                's|node the plugin directory/lib/validation-session.js|node <skill-directory>/scripts/validation-session.js|g')
+        fi
+        if [[ "$new_body" == *"node the plugin directory/bin/groundwork-run.js"* ]]; then
+            if [[ "$target" == "codex" ]]; then
+                # Reuse the existing harness-root bundle, not a second runner.
+                new_body=$(printf '%s' "$new_body" | sed 's|node the plugin directory/bin/groundwork-run.js|node <skill-directory>/../../groundwork-run.js|g')
+            else
+                needs_batch_runner=true
+                new_body=$(printf '%s' "$new_body" | sed 's|node the plugin directory/bin/groundwork-run.js|node <skill-directory>/scripts/groundwork-run.js|g')
+            fi
+        fi
+        if [[ "$new_body" == *"node the plugin directory/lib/validate-fixer-result.js"* ]]; then
+            needs_validate_scripts=true
+            new_body=$(printf '%s' "$new_body" | sed 's|node the plugin directory/lib/validate-fixer-result.js|node <skill-directory>/scripts/validate-fixer-result.js|g')
+        fi
+        if [[ "$new_body" == *"node the plugin directory/lib/worktree-identity.js"* ]]; then
+            needs_worktree_identity=true
+            new_body=$(printf '%s' "$new_body" | sed \
+                's|node the plugin directory/lib/worktree-identity.js|node <skill-directory>/scripts/worktree-identity.js|g')
+        fi
+        if [[ "$raw_body" == *'{{project_name}}'* || "$raw_body" == *'{{project_root}}'* || "$raw_body" == *'{{specs_dir}}'* || "$raw_body" == *'{{plans_dir}}'* || "$raw_body" == *'{{debug_dir}}'* || "$raw_body" == *'{{research_dir}}'* ]]; then
+            needs_project_runtime=true
+            new_body="$(portable_project_context_preamble "$(harness_name "$target")")
+
+$new_body"
+        fi
+        new_body=$(transform_model_override "skill" "$skill_name" "$target" "$new_body")
+        result="$new_fm
+$new_body"
+
+        local dest_base
+        dest_base=$(get_dest_base "$target")
+        local dest
+        case "$target" in
+            codex)    dest="$dest_base/skills/$installed/SKILL.md" ;;
+            opencode) dest="$dest_base/skills/$installed/SKILL.md" ;;
+            kiro)     dest="$dest_base/skills/$installed/SKILL.md" ;;
+            pi)       dest="$dest_base/skills/$installed/SKILL.md" ;;
+            zcode)    dest="$dest_base/skills/$installed/SKILL.md" ;;
+            zcode-plugin) dest="$dest_base/skills/$installed/SKILL.md" ;;
+        esac
+
+        require_model_override_replacement "$dest" "skill" "$skill_name"
+        write_file "$dest" "$result" "skill"
+        write_portable_references "$raw_body" "$(dirname "$dest")"
+        write_portable_skill_resources "$raw_body" "$skill_dir" "$(dirname "$dest")"
+        if [[ "$needs_project_runtime" == true ]]; then
+            local runtime_dir
+            runtime_dir="$(dirname "$dest")/scripts"
+            if [[ "$target" == "codex" ]]; then
+                write_codex_agent "$runtime_dir/project-context-cli.js" "$(<"$SOURCE_DIR/lib/project-context-cli.js")" "project context runtime" "$dest_base"
+                write_codex_agent "$runtime_dir/project-context.js" "$(<"$SOURCE_DIR/lib/project-context.js")" "project context runtime" "$dest_base"
+                write_codex_agent "$runtime_dir/atomic-write.js" "$(<"$SOURCE_DIR/lib/atomic-write.js")" "project context runtime" "$dest_base"
+            else
+                write_file "$runtime_dir/project-context-cli.js" "$(<"$SOURCE_DIR/lib/project-context-cli.js")" "project context runtime"
+                write_file "$runtime_dir/project-context.js" "$(<"$SOURCE_DIR/lib/project-context.js")" "project context runtime"
+                write_file "$runtime_dir/atomic-write.js" "$(<"$SOURCE_DIR/lib/atomic-write.js")" "project context runtime"
+            fi
+        fi
+        if [[ "$needs_runtime_context" == true ]]; then
+            local runtime_dir
+            runtime_dir="$(dirname "$dest")/scripts"
+            write_codex_agent "$runtime_dir/runtime-context-cli.js" "$(<"$SOURCE_DIR/lib/runtime-context-cli.js")" "runtime context resolver" "$dest_base"
+        fi
+        if [[ "$needs_validate_scripts" == true ]]; then
+            write_runtime_bundle "$(dirname "$dest")/scripts" "$target" "$dest_base" --helpers-tsv \
+                validation-session.js persist-unworked-findings.js validate-fixer-result.js
+        fi
+        if [[ "$needs_batch_runner" == true ]]; then
+            write_runtime_bundle "$(dirname "$dest")/scripts" "$target" "$dest_base" --tsv
+        fi
+        if [[ "$needs_worktree_identity" == true ]]; then
+            local identity_dir
+            identity_dir="$(dirname "$dest")/scripts"
+            if [[ "$target" == "codex" ]]; then
+                write_codex_agent "$identity_dir/worktree-identity.js" "$(<"$SOURCE_DIR/lib/worktree-identity.js")" "worktree identity helper" "$dest_base"
+                write_codex_agent "$identity_dir/project-context.js" "$(<"$SOURCE_DIR/lib/project-context.js")" "worktree identity helper" "$dest_base"
+                write_codex_agent "$identity_dir/atomic-write.js" "$(<"$SOURCE_DIR/lib/atomic-write.js")" "worktree identity helper" "$dest_base"
+            else
+                write_file "$identity_dir/worktree-identity.js" "$(<"$SOURCE_DIR/lib/worktree-identity.js")" "worktree identity helper"
+                write_file "$identity_dir/project-context.js" "$(<"$SOURCE_DIR/lib/project-context.js")" "worktree identity helper"
+                write_file "$identity_dir/atomic-write.js" "$(<"$SOURCE_DIR/lib/atomic-write.js")" "worktree identity helper"
+            fi
+        fi
+        ((SKILL_COUNT++)) || true
+    done
+}
+
+install_external_runner() {
+    local target="$1"
+    [[ "$target" != "codex" ]] && return 0
+
+    local dest_base
+    dest_base=$(get_dest_base "$target")
+
+    # The standalone runner bundle is exported from the checked runtime
+    # manifest (lib/external-runner-manifest.js) — never a hand-maintained
+    # helper list. The manifest validates its own closure and exits non-zero
+    # on any drift, which fails the install under set -e before any file is
+    # written.
+    local manifest_tsv
+    manifest_tsv=$(node "$SOURCE_DIR/lib/external-runner-manifest.js" --tsv)
+
+    local source_rel installed_name label
+    while IFS=$'\t' read -r source_rel installed_name; do
+        [[ -z "$source_rel" ]] && continue
+        if [[ "$installed_name" == "groundwork-run.js" ]]; then
+            label="external task runner"
+        else
+            label="external runner runtime helper"
+        fi
+        write_codex_agent "$dest_base/$installed_name" "$(<"$SOURCE_DIR/$source_rel")" "$label" "$dest_base"
+    done <<< "$manifest_tsv"
+    remove_legacy_codex_runner_memory "$dest_base"
+}
+
+# ============================================================
+# Install: Agents
+# ============================================================
+
+install_agents_for_target() {
+    local target="$1"
+    AGENT_COUNT=0
+
+    for agent_dir in "$SOURCE_DIR"/agents/*/; do
+        local agent_name
+        agent_name=$(basename "$agent_dir")
+        local agent_file="$agent_dir/AGENT.md"
+        [[ ! -f "$agent_file" ]] && continue
+
+        local content
+        content=$(<"$agent_file")
+        local desc
+        desc=$(get_fm_value "$content" "description")
+        local raw_body body_component new_body
+        raw_body=$(get_body "$content")
+        body_component="agent"
+        [[ "$target" == "pi" || "$target" == "zcode" ]] && body_component="skill"
+        if [[ "$target" == "zcode-plugin" ]]; then
+            # Native agents are single .md files: references must ship as
+            # inlined appendices rather than sibling directories
+            raw_body=$(inline_agent_references "$raw_body")
+            raw_body=$(printf '%s\n' "$raw_body" | sed 's| appendix below using the Read tool| appendix below|g')
+        fi
+        new_body=$(transform_body "$target" "$raw_body" "$body_component")
+
+        if [[ "$target" == "codex" ]]; then
+            new_body=$(printf '%s\n' "$new_body" | node \
+                "$SOURCE_DIR/lib/apply-codex-skill-policy.js" --agent "$agent_name")
+        fi
+        new_body=$(transform_model_override "agent" "$agent_name" "$target" "$new_body")
+
+        if [[ "$agent_name" == "design-consistency-checker" ]]; then
+            # The contrast-checker command must resolve on every target.
+            if [[ "$target" == "zcode-plugin" ]]; then
+                # Native plugin agents are single .md files (references ship as
+                # inlined appendices), so a script cannot travel alongside one.
+                # Rewrite to the self-contained formula instead of a dead path.
+                new_body=$(printf '%s' "$new_body" | sed \
+                    's|When available, run the plugin.s contrast checker: .node the plugin directory/lib/contrast-check.js <foreground> <background>. for each text/background pairing in changed code.|Compute the WCAG contrast ratio for each text/background pairing in changed code.|')
+                new_body=$(printf '%s' "$new_body" | sed \
+                    's|When the script is not available in this harness, compute the WCAG formula|Compute it with the WCAG formula|')
+            else
+                # Same scripts/ convention as exported skills: rewrite the
+                # command to the shipped copy (copied after the case below).
+                local dir_token="<agent-directory>"
+                [[ "$target" == "pi" || "$target" == "zcode" ]] && dir_token="<skill-directory>"
+                new_body=$(printf '%s' "$new_body" | sed \
+                    "s|node the plugin directory/lib/contrast-check.js|node ${dir_token}/scripts/contrast-check.js|g")
+            fi
+        fi
+
+        local dest_base
+        dest_base=$(get_dest_base "$target")
+        local portable_dir="$dest_base/agents"
+
+        case "$target" in
+            codex)
+                local claude_model claude_effort codex_model codex_effort
+                claude_model=$(get_fm_value "$content" "model")
+                claude_effort=$(get_fm_value "$content" "effort")
+                resolve_codex_agent_policy "$agent_name" "$claude_model" "$claude_effort"
+                codex_model="$CODEX_AGENT_MODEL"
+                codex_effort="$CODEX_AGENT_EFFORT"
+
+                local render_args=(
+                    --name "$agent_name"
+                    --description "$desc"
+                )
+                [[ -n "$codex_model" ]] && render_args+=(--model "$codex_model")
+                [[ -n "$codex_effort" ]] && render_args+=(--effort "$codex_effort")
+
+                local codex_agent
+                codex_agent=$(printf '%s' "$new_body" | node \
+                    "$SOURCE_DIR/lib/render-codex-agent.js" "${render_args[@]}")
+                local dest="$dest_base/agents/${agent_name}.toml"
+                require_model_override_replacement "$dest" "agent" "$agent_name"
+                write_codex_agent "$dest" "$codex_agent" "agent" "$dest_base"
+                if [[ "$agent_name" == "validation-fixer" ]]; then
+                    write_runtime_bundle "$dest_base/agents/$agent_name/scripts" "$target" "$dest_base" --helpers-tsv validate-fixer-result.js
+                fi
+                remove_legacy_codex_agent_skill "$agent_name" "$dest_base"
+                ;;
+            opencode)
+                local new_fm
+                new_fm=$(transform_frontmatter "$target" "agent" "$content" "$agent_name")
+                local dest="$dest_base/agents/review-${agent_name}.md"
+                require_model_override_replacement "$dest" "agent" "$agent_name"
+                write_file "$dest" "$new_fm
+$new_body" "agent"
+                ;;
+            kiro)
+                # JSON config + prompt file pair
+                local json_content
+                json_content=$(printf '{\n  "name": "%s",\n  "description": "%s",\n  "prompt": "file://./%s-prompt.md"\n}' \
+                    "$agent_name" "$desc" "$agent_name")
+                write_file "$dest_base/agents/${agent_name}.json" "$json_content" "agent config"
+                local prompt_dest="$dest_base/agents/${agent_name}-prompt.md"
+                require_model_override_replacement "$prompt_dest" "agent" "$agent_name"
+                write_file "$prompt_dest" "$new_body" "agent prompt"
+                ;;
+            pi)
+                # Install as a skill with review- prefix (Pi has no native agent concept)
+                local installed_name="review-${agent_name}"
+                local new_fm
+                new_fm=$(transform_frontmatter "$target" "skill" "$content" "$installed_name")
+                local dest="$dest_base/skills/${installed_name}/SKILL.md"
+                portable_dir="$dest_base/skills/${installed_name}"
+                require_model_override_replacement "$dest" "agent" "$agent_name"
+                write_file "$dest" "$new_fm
+$new_body" "review agent"
+                ;;
+            zcode)
+                # Install as a skill with review- prefix (ZCode loads custom
+                # agents only from marketplace plugins, not from user files)
+                local installed_name="review-${agent_name}"
+                local new_fm
+                new_fm=$(transform_frontmatter "$target" "skill" "$content" "$installed_name")
+                local dest="$dest_base/skills/${installed_name}/SKILL.md"
+                portable_dir="$dest_base/skills/${installed_name}"
+                require_model_override_replacement "$dest" "agent" "$agent_name"
+                write_file "$dest" "$new_fm
+$new_body" "review agent"
+                ;;
+            zcode-plugin)
+                # Native plugin agent: ZCode loads agents from flat
+                # agents/<name>.md files inside a marketplace plugin
+                local agent_color
+                agent_color=$(get_fm_value "$content" "color")
+                local new_fm="---
+name: ${agent_name}
+description: ${desc}"
+                [[ -n "$agent_color" ]] && new_fm+=$'\n'"color: ${agent_color}"
+                new_fm+=$'\n---'
+                local dest="$dest_base/agents/${agent_name}.md"
+                require_model_override_replacement "$dest" "agent" "$agent_name"
+                write_file "$dest" "$new_fm
+$new_body" "agent"
+                ;;
+        esac
+
+        if [[ "$agent_name" == "design-consistency-checker" && "$target" != "zcode-plugin" ]]; then
+            # Ship the contrast checker the rewritten command points at
+            # (per-skill dir for pi/zcode, shared agents root otherwise).
+            local contrast_dir="$portable_dir/scripts"
+            if [[ "$target" == "codex" ]]; then
+                write_codex_agent "$contrast_dir/contrast-check.js" \
+                    "$(<"$SOURCE_DIR/lib/contrast-check.js")" "WCAG contrast checker" "$dest_base"
+            else
+                write_file "$contrast_dir/contrast-check.js" \
+                    "$(<"$SOURCE_DIR/lib/contrast-check.js")" "WCAG contrast checker"
+            fi
+        fi
+
+        write_portable_references "$raw_body" "$portable_dir"
+
+        ((AGENT_COUNT++)) || true
+    done
+}
+
+# ============================================================
+# Install: Pi Extension
+# ============================================================
+
+install_pi_extension() {
+    local dest_base
+    dest_base=$(get_dest_base "pi")
+    local ext_dir="$dest_base/extensions/groundwork"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [dry-run] $ext_dir/ (Pi extension)"
+        return 0
+    fi
+
+    # Copy the pre-built extension from source
+    if [[ -d "$SOURCE_DIR/pi-extension" ]]; then
+        mkdir -p "$ext_dir/lib"
+        cp "$SOURCE_DIR/pi-extension/"*.ts "$ext_dir/" 2>/dev/null || true
+        cp "$SOURCE_DIR/pi-extension/lib/"*.ts "$ext_dir/lib/" 2>/dev/null || true
+        # Dependency-free JS runtime helpers the TypeScript sources delegate to
+        cp "$SOURCE_DIR/pi-extension/lib/"*.js "$ext_dir/lib/" 2>/dev/null || true
+        echo "  [wrote] $ext_dir/ (Pi extension)"
+    else
+        echo "  [warn] Pi extension source not found at $SOURCE_DIR/pi-extension"
+    fi
+}
+
+# ============================================================
+# Summary
+# ============================================================
+
+print_summary() {
+    local target="$1"
+    echo ""
+    echo "  Summary for $target:"
+    if [[ ( "$target" == "pi" || "$target" == "zcode" ) && "$SKILLS_ONLY" != true && $AGENT_COUNT -gt 0 ]]; then
+        echo "    Skills installed: $((SKILL_COUNT + AGENT_COUNT)) (includes $AGENT_COUNT review agents)"
+    else
+        echo "    Skills installed: $SKILL_COUNT"
+    fi
+    if [[ "$SKILLS_ONLY" != true && "$target" != "pi" && "$target" != "zcode" ]]; then
+        echo "    Agents installed: $AGENT_COUNT"
+    fi
+}
+
+# ============================================================
+# Main
+# ============================================================
+
+main() {
+    parse_args "$@"
+    auto_detect_source
+    load_config
+    load_model_override
+    preflight_model_override_replacements
+
+    # Fail the whole export before any file is written if the external
+    # runner runtime closure is inconsistent (unmanifested transitive
+    # imports, unclassified dynamic requires, sources outside bin//lib/).
+    node "$SOURCE_DIR/lib/external-runner-manifest.js" --tsv > /dev/null
+
+    echo "Groundwork Installer"
+    echo "  Source: $SOURCE_DIR"
+    echo "  Scope:  $SCOPE"
+    [[ "$DRY_RUN" == true ]] && echo "  Mode:   DRY RUN"
+    [[ "$FORCE" == true ]] && echo "  Mode:   FORCE overwrite"
+    echo ""
+
+    for target in "${TARGETS[@]}"; do
+        echo "=== $target ==="
+        echo ""
+
+        if [[ "$target" == "claude-code" ]]; then
+            if [[ "$ALLOW_MANUAL_CLAUDE" != true ]]; then
+                echo "  For Claude Code, we recommend installing via the marketplace:"
+                echo ""
+                echo "    claude plugin marketplace add https://github.com/etr/groundwork-marketplace"
+                echo "    claude plugin install groundwork"
+                echo ""
+                echo "  To use this installer instead, pass --allow-manual-claude-code-install"
+                echo ""
+                continue
+            fi
+
+            install_claude_code
+            echo ""
+            echo "  Summary for claude-code:"
+            echo "    Full plugin copy (no transformation)"
+            echo ""
+            echo "  Note: Hooks require manual setup for each tool."
+            echo ""
+            continue
+        fi
+
+        install_skills_for_target "$target"
+        install_external_runner "$target"
+
+        if [[ "$SKILLS_ONLY" != true ]]; then
+            install_agents_for_target "$target"
+        fi
+
+        # Pi: install the TypeScript extension for lifecycle integration
+        if [[ "$target" == "pi" ]]; then
+            install_pi_extension
+        fi
+
+        print_summary "$target"
+        echo ""
+        if [[ "$target" == "zcode-plugin" ]]; then
+            echo "  Note: Plugin flavor — package with build-zcode-marketplace.sh (hooks included)."
+        else
+            echo "  Note: Hooks require manual setup for each tool."
+        fi
+        echo ""
+    done
+
+    echo "Done."
+}
+
+main "$@"

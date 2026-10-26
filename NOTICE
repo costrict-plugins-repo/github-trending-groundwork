@@ -1,0 +1,42 @@
+Groundwork
+Copyright (c) 2025 Groundwork Contributors
+
+This project includes code from the following sources:
+
+================================================================================
+superpowers
+Copyright (c) 2025 Jesse Vincent
+https://github.com/obra/superpowers
+License: MIT
+
+Components used:
+- Base plugin structure
+- test-driven-development skill (substantially modified with merged tdd-workflow)
+- Hooks and lib files
+
+================================================================================
+claude-plugins-official
+Copyright (c) 2025 Anthropic
+https://github.com/anthropics/claude-plugins-official
+License: MIT
+
+Components used:
+- code-review plugin (code-review command)
+
+================================================================================
+impeccable
+Copyright (c) 2025 Paul Bakaus
+https://github.com/pbakaus/impeccable
+License: Apache 2.0
+
+Based on Anthropic's frontend-design skill:
+https://github.com/anthropics/skills/tree/main/skills/frontend-design
+Copyright (c) 2025 Anthropic, PBC
+License: Apache 2.0
+
+Components used:
+- Design system reference guides (color-and-contrast-guide, interaction-design-guide,
+  motion-design-guide, spatial-design-guide, typography-guide, ux-writing-guide)
+  adapted from Impeccable's domain-specific reference files
+- Design consistency checker agent checks for interaction quality, UX writing,
+  and expanded accessibility derived from these references
