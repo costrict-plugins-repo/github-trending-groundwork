@@ -1,0 +1,150 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Groundwork is a Claude Code plugin that provides a skills library for structured development workflows. It contains 40 skills spanning the full lifecycle — discovery, domain modeling, architecture, planning, TDD, debugging, validation, and shipping. Every capability is a skill; there is no separate commands layer (skills are both user-invocable via `/groundwork:<name>` and, where appropriate, model-invocable).
+
+The `using-groundwork` skill is the **lifecycle router**: it maps work → skill across every phase and is the only way the model can surface user-only leaves (which are invisible to it at call time). When authoring or editing a skill, see `docs/developing-skills.md` (contributor guide: anatomy, frontmatter, tier selection, authoring discipline, progressive disclosure).
+
+## Project Structure
+
+This is a **Claude Code plugin**, not a traditional software project. There is no build step for Claude Code use. A separate installer (`install-skills.sh`) *exports* the skills to other AI coding harnesses (see "Multi-target installation" below).
+
+```
+groundwork/
+├── .claude-plugin/plugin.json  # Plugin manifest
+├── skills/                     # Markdown-based workflow skills (SKILL.md files) — the only entry-point layer
+├── agents/                     # Subagent definitions (AGENT.md files)
+├── hooks/                      # Event-driven automation (SessionStart, PostToolUse, SubagentStop, PreCompact)
+├── lib/                        # JavaScript utilities (+ co-located *.test.js)
+├── references/                 # Runtime reference files loaded by skills/agents
+│   ├── checklists/             # Shared checklists read by BOTH a producer skill and a reviewer agent (testing: test-driven-development ↔ test-quality-reviewer; accessibility: ux-design ↔ design-consistency-checker)
+│   └── engineering-principles.md  # Named-principle vocabulary (deep modules, Hyrum's Law, Chesterton's Fence, …)
+├── tests/                      # Node test suites; run via tests/run-tests.sh
+├── docs/                       # User-facing documentation
+├── install-skills.sh           # Multi-target export installer (Codex, OpenCode, Kiro, Pi, ZCode)
+├── install-config.txt          # Export exceptions (drops + renames); fail-closed by default
+├── build-zcode-marketplace.sh  # Packages the --zcode-plugin export as a ZCode marketplace (dist/, gitignored)
+└── pi-extension/               # Pre-built TypeScript extension copied into Pi installs
+```
+
+## Component Formats
+
+### Skills (`skills/<name>/SKILL.md`)
+```markdown
+---
+name: skill-name
+description: Use when [condition] - [what it does]
+requires: optional-skill-1, optional-skill-2   # optional skill dependencies
+argument-hint: "[optional-args]"               # optional, shown in slash autocomplete
+allowed-tools: Bash(specific:*), Grep, Read    # optional, pre-approves tools
+disable-model-invocation: true                 # optional, see invocation table below
+user-invocable: false                          # optional, see invocation table below
+---
+[Skill content in markdown]
+```
+
+The optional `requires` field declares skill dependencies. These are validated by `lib/validate-plugin.js`.
+
+#### Invocation control
+
+Skills replaced the old commands layer. Three tiers, set via frontmatter:
+
+| Tier | `user-invocable` | `disable-model-invocation` | User slash | Model auto | Callable by other skills | Examples |
+|------|:--:|:--:|:--:|:--:|:--:|----------|
+| **User workflow** (leaf) | (default) | `true` | ✅ | ❌ | ❌ | `just-do-it`, `ship`, `review-pr` |
+| **Chain / dual** | (default) | (default) | ✅ | ✅ | ✅ | `debug`, `work-on`, `plan-task`, `validate` |
+| **Hidden library** | `false` | (default) | ❌ | ✅ | ✅ | `test-driven-development`, `use-git-worktree` |
+
+> **Important:** `disable-model-invocation: true` also blocks programmatic `Skill()` calls from
+> other skills. Never put it on a skill that appears in another skill's orchestration chain.
+
+## Development Workflow
+
+### Testing Changes Locally
+
+1. Symlink or copy the plugin to `~/.claude/plugins/groundwork`
+2. Restart Claude Code or run `/init` to reload
+3. Test skills via the `Skill` tool or slash commands
+
+### Adding a New Skill
+
+1. Create `skills/<skill-name>/SKILL.md`
+2. Add YAML frontmatter with `name` and `description`; set the invocation tier (see table above)
+3. Write the skill content following existing patterns
+4. Test with `/groundwork:<skill-name>` or the Skill tool
+
+### Running Tests
+
+```
+bash tests/run-tests.sh
+```
+
+Runs every `tests/*.test.js` suite (plain Node `assert`, no dependencies). `tests/install-config.test.js` guards the export installer: skills↔config parity and zero Claude-Code-only leakage in generated output.
+
+### Hook Events
+
+The plugin uses these hook events (see `hooks/hooks.json`):
+- **SessionStart** (`session-start.sh`): Loads skill context, checks for updates, detects project state
+- **PostToolUse** (`check-commit-alignment.sh`, `resolve-template-vars.js`): Validates commit/spec alignment; resolves `{{template}}` vars
+- **SubagentStop** (`validate-agent-output.sh`): Validates agent output format
+- **PreCompact** (`pre-compact.sh`): Preserves skill state before context compaction
+
+## Key Architectural Patterns
+
+### Skill Shadowing
+Personal skills in `~/.claude/skills/` override plugin skills with the same name. Use `groundwork:skill-name` prefix to force the plugin version.
+
+### Frontmatter Parsing
+`lib/skills-core.js` extracts YAML frontmatter from SKILL.md files. The frontmatter must be at the start of the file, delimited by `---`.
+
+### Hooks Configuration
+Hooks are defined in `hooks/hooks.json` and use `${CLAUDE_PLUGIN_ROOT}` for portable paths.
+
+### Library Utilities
+
+| File | Purpose |
+|------|---------|
+| `lib/skills-core.js` | Skill discovery, frontmatter parsing, path resolution |
+| `lib/contrast-check.js` | WCAG contrast ratio CLI — reviewers verify instead of eyeballing |
+| `lib/frontmatter.js` | YAML frontmatter parsing utilities |
+| `lib/validate-plugin.js` | Plugin validation (frontmatter, references, permissions) |
+| `lib/check-updates.js` | Git-based update checking (throttled to 1x/day) |
+| `lib/project-context.js` | Active-project resolution (monorepo `.groundwork.yml`) |
+| `lib/detect-project-state.js` | Detects specs/monorepo structure at SessionStart |
+| `lib/spec-router.js`, `lib/specs-io.js` | Locate and read spec/architecture/task files |
+| `lib/inject-specs.js` | Extracts features/NFRs/decisions from specs into context |
+| `lib/resolve-template-vars.js` | Resolves `{{specs_dir}}`, `{{plans_dir}}`, `{{debug_dir}}`, `{{research_dir}}` etc. in skill bodies (PostToolUse) |
+| `lib/persist-project.js`, `lib/persist-unworked-findings.js` | Persist project + validation state (per terminal pane where pane identity exists; per-chat snapshots + labeled workspace default in pane-less UIs like ZCode) |
+| `lib/atomic-write.js` | Shared tmp+fsync+rename writes for anything a concurrent reader can observe |
+| `lib/owned-lock.js` | Token-bearing O_EXCL lock with holder process identity and identity-checked release |
+| `lib/lease-mutation.js` | Serialized mutation-turn queue fencing every fixed-lock/lease transition (compare-and-delete only inside a turn) |
+| `lib/process-identity.js` | PID + process-start identity for same-host liveness probes (locks, heartbeats, reaping) |
+| `lib/external-runner-manifest.js` | Checked manifest of the exported standalone runner runtime; validates its transitive import closure |
+| `lib/state-dir.js` | Prints the harness-resolved state directory so bash hooks/statusline cannot diverge from Node writers |
+| `lib/worktree-identity.js` | Single source of truth for task worktree paths and branch names (project-qualified in monorepos); CLI for skills, factory for the runner |
+| `lib/plan-check.js` | Verifies a legacy repo-root plan's recorded project before adoption |
+| `lib/transform-agents.js` | Rewrites `Agent()` calls when exporting skills to other harnesses |
+| `lib/filter-zcode-hooks.js` | Filters hooks.json to the hook events ZCode supports (marketplace bundle) |
+| `lib/utils.js` | Shared helpers |
+
+### Path safety
+
+Files produced by skills follow five invariants — project-scoped artifacts and invocation-unique run artifacts, absolute operational bindings, no fixed shared temp paths, serialized fixed-state transitions (owned-lock/lease-mutation with holder identity), and worktree/branch identity from `lib/worktree-identity.js` — enforced by `tests/path-safety.test.js` with per-rule scope (corpus-wide scans for invariants 1 and 3; a functional check for invariant 2; primitive-level checks plus a corpus-wide pointer prohibition for invariant 4; targeted instruction-surface checks for invariant 5 and the journal/handoff applications of invariant 1) (see `docs/developing-skills.md` → "Path Safety" for the full rules and the reserved-dirs table): artifacts keyed on per-project identifiers are project-scoped via template variables (in both template and literal relative shell spellings); run-keyed artifacts carry uniqueness suffixes; operational bindings are normalized absolute paths; fixed mutable state ("active" pointers, owned locks, lease publications) transitions only through the serialized mutation protocol (`lib/owned-lock.js`, `lib/lease-mutation.js`, holder identity from `lib/process-identity.js`); and task worktree/branch identity comes from `lib/worktree-identity.js`. The exported standalone runner closure is declared and validated by `lib/external-runner-manifest.js`.
+
+## Multi-target installation
+
+`install-skills.sh` exports the skills/agents to non-Claude harnesses (`--codex`, `--opencode`, `--kiro`, `--pi`, `--zcode`, `--zcode-plugin`; `--claude-code` recommends the marketplace). It is **fail-closed**: every skill in `skills/` is exported as `groundwork-<name>` automatically — `install-config.txt` lists only exceptions (`<name> = drop` or `<name> = <other-name>`), so a new skill can never be silently omitted.
+
+During export it rewrites Claude-specific constructs to harness-neutral prose: `Skill(...)`/`Agent(...)` calls (via `lib/transform-agents.js`), `${CLAUDE_PLUGIN_ROOT}`, `/groundwork:` slash hints, tool names (Pi), model names (Codex translation; ZCode translation to unversioned GLM family names — "GLM with reasoning at max" / "GLM-Flash" — phrased as model-picker/settings actions since ZCode has no `/model` or `/effort` commands). Agents install as native TOML custom agents (Codex), standalone agent files (OpenCode), JSON+prompt pairs (Kiro), `review-`prefixed skills (Pi and the ZCode file export), or native flat `agents/<name>.md` files with references inlined as appendices (the `--zcode-plugin` marketplace flavor — ZCode auto-discovers plugin agents from an `agents/` directory). Pi additionally gets `pi-extension/`.
+
+`build-zcode-marketplace.sh` packages the `--zcode-plugin` export as a self-contained ZCode marketplace (translated skills + native agents + hooks filtered to ZCode's seven supported events via `lib/filter-zcode-hooks.js` + `marketplace.json` with `source: "./"`). The output is force-pushed to the orphan `zcode-marketplace` branch of this repository (CI does it on every release); users add it as `etr/groundwork#zcode-marketplace`. The branch is generated output — never edit it by hand. The installer targets **bash 3.2 + BSD sed** (stock macOS) — avoid bash-4-only features (associative arrays, `mapfile`) and `;`-joined sed programs. `tests/install-config.test.js` enforces parity and no-leakage, and `tests/zcode-marketplace.test.js` guards the bundle contract; run them after touching the installer or adding skills.
+
+## External Dependencies
+
+- `git` - Repository operations
+- `gh` - GitHub CLI for PR workflows
+- `node` - JavaScript runtime (for hooks, lib, and the export installer's transforms)
+- `bash` (3.2+) - Hook and installer scripts
