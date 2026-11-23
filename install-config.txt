@@ -1,0 +1,17 @@
+# install-config.txt
+#
+# Exceptions to the default export rule. By default EVERY skill in skills/ is
+# exported to non-Claude targets as "groundwork-<skill-name>" (fail-closed: a
+# new skill is exported automatically — you cannot forget to register it).
+#
+# List only exceptions here, one per line:
+#   <skill-dir-name> = drop          exclude from non-Claude targets
+#   <skill-dir-name> = <other-name>  export under a custom name (rare)
+#
+# Claude Code always gets a full, untransformed plugin copy regardless of this file.
+
+# Plugin-management / Claude-Code-specific skills — excluded on other targets
+groundwork-check = drop
+groundwork-help = drop
+skills = drop
+using-groundwork = drop
